@@ -1,4 +1,4 @@
-from fastapi import FastAPI, WebSocket, Request
+from fastapi import FastAPI, WebSocket, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from contextlib import asynccontextmanager
@@ -16,6 +16,13 @@ from starlette.websockets import WebSocketDisconnect
 from wasabi import msg  # type: ignore[import]
 
 from goldenverba import verba_manager
+
+from goldenverba.server.types import FileConfig, FileStatus
+import base64
+
+
+# Define the supported extensions
+SUPPORTED_EXTENSIONS = {"docx", "pdf", "xlsx", "pptx", "json"}
 
 from goldenverba.server.types import (
     ResetPayload,
@@ -139,7 +146,6 @@ async def serve_frontend():
 # Define health check endpoint
 @app.get("/api/health")
 async def health_check():
-
     await client_manager.clean_up()
 
     if production == "Local":
@@ -156,6 +162,185 @@ async def health_check():
         }
     )
 
+
+@app.get("/api/sync-drive-from-folder")
+async def sync_drive_from_folder():
+    try:
+        # Get the folder path from environment variable
+        folder_path = os.getenv("GOOGLE_DRIVE_SYNC_FOLDER", None)
+        if not folder_path:
+            raise HTTPException(status_code=400, detail="SYNC_DRIVE_FOLDER_PATH environment variable is not set.")
+
+        # Use pathlib for cross-platform compatibility
+        folder = Path(folder_path)
+
+        if not folder.exists() or not folder.is_dir():
+            raise HTTPException(status_code=400, detail="The provided folder path does not exist or is not a directory.")
+
+        # List all files in the folder and its subdirectories
+        file_paths = [
+            str(file) for file in folder.rglob("*")  # rglob() is used to recursively list files
+            if file.suffix[1:].lower() in SUPPORTED_EXTENSIONS  # Check file extension without the leading dot
+        ]
+
+        if not file_paths:
+            return {"message": "No supported files found in the folder."}
+
+        # Get credentials (you might need to adjust this based on your environment)
+        credentials = Credentials(
+            deployment='Custom',
+            url="localhost",
+            key=''
+        )
+
+        # Connect to the Weaviate client
+        client = await client_manager.connect(credentials)
+
+        # Dummy logger for reporting (since websockets are not used)
+        class DummyLogger:
+            async def send_report(self, *args, **kwargs):
+                pass
+
+            async def create_new_document(self, *args, **kwargs):
+                pass
+
+        logger = DummyLogger()
+
+        # Process each file in the filtered list
+        print(f"Nuber of files {len(file_paths)}")
+        for file_path in file_paths:
+            # Extract file information
+            full_file_name = os.path.basename(file_path)
+            full_file_name_split = full_file_name.split('.')
+            extension = full_file_name_split.pop()
+            fileID = full_file_name_split.pop()
+            new_filename = ".".join(full_file_name_split)
+
+            # Read the file
+            with open(file_path, "rb") as f:
+                file_bytes = f.read()
+
+            # Encode the content to base64
+            encoded_content = base64.b64encode(file_bytes).decode('utf-8')
+            print(f"file ID: {fileID}")
+            print(f"filename: {new_filename}")
+            print(f"extension: {extension}")
+            # Create a FileConfig object with the new filename
+            fileConfig = FileConfig(
+                fileID=fileID,
+                filename=new_filename,  # Use the newly formatted filename
+                isURL=False,
+                overwrite=False,
+                extension=extension,
+                source='',
+                content=encoded_content,
+                labels=['Document'],
+                rag_config=manager.create_config(),  # Get default RAG config
+                file_size=len(file_bytes),
+                status=FileStatus.READY,
+                metadata='',
+                status_report={}
+            )
+            fileConfig.rag_config["Reader"].selected = 'Unstructured IO'
+            # Call import_document for each file
+            await manager.import_document(client, fileConfig, logger)
+
+        return {"message": "Sync completed successfully"}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"An error occurred: {str(e)}")
+
+
+@app.post("/api/sync_drive")
+async def sync_drive(request: Request):
+    try:
+        # Parse the request body to get the list of file paths
+        request_data = await request.json()
+        file_paths = request_data.get("file_paths", [])
+
+        if not file_paths:
+            return JSONResponse(
+                content={"message": "No file paths provided."},
+                status_code=400
+            )
+
+        # Get credentials (you might need to adjust this based on your environment)
+        credentials = Credentials(
+            deployment='Custom',
+            url="localhost",
+            key=''
+        )
+
+        # Connect to the Weaviate client
+        client = await client_manager.connect(credentials)
+
+        # Since LoggerManager expects a websocket, and we're not using websockets here,
+        # we can create a dummy logger that does nothing
+        class DummyLogger:
+            async def send_report(self, *args, **kwargs):
+                pass
+
+            async def create_new_document(self, *args, **kwargs):
+                pass
+
+        logger = DummyLogger()
+
+        for file_path in file_paths:
+            # Check if the file exists
+            print(f"file_path {file_path}")
+            if not os.path.exists(file_path):
+                print(f"Skipping non existing path: {file_path}")
+                continue  # Skip the file if it doesn't exist
+
+            # Extract file information
+            print(f"file_path {file_path}")
+            fileID = os.path.basename(file_path)
+            filename = fileID
+            extension = os.path.splitext(fileID)[1][1:]  # Get file extension without dot
+            print(f"fileID: {fileID}")
+            print(f"filename: {filename}")
+            print(f"extension: {extension}")
+
+            # Read the file
+            with open(file_path, "rb") as f:
+                file_bytes = f.read()
+
+            # Encode the content to base64
+            encoded_content = base64.b64encode(file_bytes).decode('utf-8')
+
+            # Create a FileConfig object
+            fileConfig = FileConfig(
+                fileID=fileID,
+                filename=filename,
+                isURL=False,
+                overwrite=False,
+                extension=extension,
+                source='',
+                content=encoded_content,
+                labels=['Document'],
+                rag_config=manager.create_config(),  # Get default RAG config
+                file_size=len(file_bytes),
+                status=FileStatus.READY,
+                metadata='',
+                status_report={}
+            )
+
+            # Call import_document for each file
+            await manager.import_document(client, fileConfig, logger)
+
+        return JSONResponse(
+            content={
+                "message": "Sync completed successfully",
+            }
+        )
+
+    except Exception as e:
+        return JSONResponse(
+            content={
+                "message": f"An error occurred: {str(e)}",
+            },
+            status_code=500
+        )
 
 @app.post("/api/connect")
 async def connect_to_verba(payload: ConnectPayload):
@@ -251,6 +436,12 @@ async def websocket_import_files(websocket: WebSocket):
             fileConfig = batcher.add_batch(batch_data)
             if fileConfig is not None:
                 client = await client_manager.connect(batch_data.credentials)
+                print("Hello !!!")
+                print(f"In websocket_import_files..........")
+                print(f"client : {client}")
+                print(f"fileConfig : {fileConfig}")
+                print(f"logger : {logger}")
+                print(f"batch_data : {batch_data.chunk}")
                 await asyncio.create_task(
                     manager.import_document(client, fileConfig, logger)
                 )
